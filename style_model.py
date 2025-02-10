@@ -34,34 +34,42 @@ class StyleModelConditioner:
     FUNCTION = "apply_style"
     CATEGORY = "style_model"
 
-    def _patchify_mask(self, mask, patch_size=14):
+    def processMask(self, mask, img_size=384, patch_size=14):
         """
-        将mask转换为patches。
+        处理mask，保持与原始图像的对齐关系。
         
         参数:
             mask (torch.Tensor): 输入mask
+            img_size (int): 目标图像大小
             patch_size (int): patch的大小
             
         返回:
-            torch.Tensor: patches化的mask
+            torch.Tensor: 处理后的mask
         """
         if mask is None:
             return None
-            
+        
+        # 标准化输入维度
         if len(mask.shape) == 2:
-            mask = mask.unsqueeze(0)  # 添加 batch 维度
+            mask = mask.unsqueeze(0).unsqueeze(0)  # 添加 batch 和 channel 维度
+        elif len(mask.shape) == 3:
+            mask = mask.unsqueeze(1)  # 添加 channel 维度
         
-        b, h, w = mask.shape
-        img_size = h  # 假设输入是方形的
-        tokens = img_size // patch_size
+        # 直接调整到目标尺寸，保持对齐关系
+        mask = torch.nn.functional.interpolate(
+            mask,
+            size=(img_size, img_size),
+            mode="nearest"  # 使用最近邻插值以保持mask的二值性
+        )
         
-        # 使用最大池化进行下采样，保持mask的二值性
-        pooled = torch.nn.MaxPool2d(
+        # 转换为patches
+        toks = img_size // patch_size
+        mask = torch.nn.MaxPool2d(
             kernel_size=(patch_size, patch_size),
             stride=patch_size
-        )(mask.unsqueeze(1))  # 添加通道维度
+        )(mask).view(-1, toks, toks, 1)
         
-        return pooled.view(b, tokens, tokens, 1)
+        return mask
 
     def _create_attention_mask(self, txt_shape, n_cond, mask_ref_size, attn_bias, device, existing_mask=None):
         """
@@ -121,7 +129,7 @@ class StyleModelConditioner:
         # 处理 mask
         if mask is not None:
             # 将 mask 转换为 patches
-            patch_mask = self._patchify_mask(mask)
+            patch_mask = self.processMask(mask)
             if patch_mask is not None:
                 # 重塑 cond 以应用 mask
                 b, t, h = cond.shape
