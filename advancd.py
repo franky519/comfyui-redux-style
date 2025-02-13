@@ -1,4 +1,3 @@
-
 import numpy as np
 import torch
 import comfy
@@ -196,7 +195,7 @@ IMAGE_MODES = [
     "autocrop with mask"
 ]
 
-class ReduxAdvanced:
+class StyleModelAdvanced:
     @classmethod
     def INPUT_TYPES(s):
         return {"required": {"conditioning": ("CONDITIONING", ),
@@ -206,33 +205,70 @@ class ReduxAdvanced:
                              "downsampling_factor": ("INT", {"default": 3, "min": 1, "max":9}),
                              "downsampling_function": (["nearest", "bilinear", "bicubic","area","nearest-exact"], {"default": "area"}),
                              "mode": (IMAGE_MODES, {"default": "center crop (square)"}),
-                             "weight": ("FLOAT", {"default": 1.0, "min":0.0, "max":1.0, "step":0.01})
+                             "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.01}),
+                             "strength_type": (["multiply", "attn_bias"], {"default": "attn_bias"})
                             },
                 "optional": {
                             "mask": ("MASK", ),
                             "autocrop_margin": ("FLOAT", {"default": 0.1, "min": 0.0, "max": 1.0, "step": 0.01})
                 }}
-    RETURN_TYPES = ("CONDITIONING","IMAGE", "MASK")
-    FUNCTION = "apply_stylemodel"
+    RETURN_TYPES = ("CONDITIONING", "IMAGE", "MASK")
+    RETURN_NAMES = ("styled_conditioning", "processed_image", "processed_mask")
+    FUNCTION = "apply_style"
+    CATEGORY = "style_model"
 
-    CATEGORY = "conditioning/style_model"
+    def _create_attention_mask(self, txt_shape, n_cond, mask_ref_size, attn_bias, device, existing_mask=None):
+        """创建或更新注意力掩码"""
+        n_txt = txt_shape[1]
+        n_ref = mask_ref_size[0] * mask_ref_size[1]
+        
+        if existing_mask is None:
+            existing_mask = torch.zeros((txt_shape[0], n_txt + n_ref, n_txt + n_ref), dtype=torch.float16)
+        elif existing_mask.dtype == torch.bool:
+            existing_mask = torch.log(existing_mask.to(dtype=torch.float16))
+            
+        new_mask = torch.zeros((txt_shape[0], n_txt + n_cond + n_ref, n_txt + n_cond + n_ref), dtype=torch.float16)
+        
+        # 复制现有掩码的四个象限
+        new_mask[:, :n_txt, :n_txt] = existing_mask[:, :n_txt, :n_txt]
+        new_mask[:, :n_txt, n_txt+n_cond:] = existing_mask[:, :n_txt, n_txt:]
+        new_mask[:, n_txt+n_cond:, :n_txt] = existing_mask[:, n_txt:, :n_txt]
+        new_mask[:, n_txt+n_cond:, n_txt+n_cond:] = existing_mask[:, n_txt:, n_txt:]
+        
+        # 填充新的注意力偏置
+        new_mask[:, :n_txt, n_txt:n_txt+n_cond] = attn_bias
+        new_mask[:, n_txt+n_cond:, n_txt:n_txt+n_cond] = attn_bias
+        
+        return new_mask.to(device)
 
-    def apply_stylemodel(self, clip_vision, image, style_model, conditioning, downsampling_factor, downsampling_function,mode,weight, mask=None, autocrop_margin=0.0):
+    def apply_style(self, clip_vision, image, style_model, conditioning, downsampling_factor, 
+                        downsampling_function, mode, strength, strength_type, mask=None, autocrop_margin=0.0):
         image, masko = prepareImageAndMask(clip_vision, image, mask, mode, autocrop_margin)
-        clip_vision_output,mask=(clip_vision.encode_image(image), patchifyMask(masko))
-        mode="area"
+        clip_vision_output, mask = (clip_vision.encode_image(image), patchifyMask(masko))
+        mode = "area"
         cond = style_model.get_cond(clip_vision_output).flatten(start_dim=0, end_dim=1).unsqueeze(dim=0)
-        (b,t,h)=cond.shape
+        (b,t,h) = cond.shape
         m = int(np.sqrt(t))
-        if downsampling_factor>1:
+        
+        if downsampling_factor > 1:
             cond = cond.view(b, m, m, h)
             if mask is not None:
-                cond = cond*mask
-            cond=torch.nn.functional.interpolate(cond.transpose(1,-1), size=(m//downsampling_factor, m//downsampling_factor), mode=downsampling_function)
-            cond=cond.transpose(1,-1).reshape(b,-1,h)
-            mask = None if mask is None else torch.nn.functional.interpolate(mask.view(b, m, m, 1).transpose(1,-1), size=(m//downsampling_factor, m//downsampling_factor), mode=mode).transpose(-1,1)
-        cond = cond*(weight*weight)
+                cond = cond * mask
+            cond = torch.nn.functional.interpolate(cond.transpose(1,-1), 
+                                                 size=(m//downsampling_factor, m//downsampling_factor), 
+                                                 mode=downsampling_function)
+            cond = cond.transpose(1,-1).reshape(b,-1,h)
+            mask = None if mask is None else torch.nn.functional.interpolate(
+                mask.view(b, m, m, 1).transpose(1,-1), 
+                size=(m//downsampling_factor, m//downsampling_factor), 
+                mode=mode).transpose(-1,1)
+
+        if strength_type == "multiply":
+            cond = cond * strength
+
+        n_cond = cond.shape[1]
         c = []
+
         if mask is not None:
             mask = (mask>0).reshape(b,-1)
             max_len = mask.sum(dim=1).max().item()
@@ -242,9 +278,24 @@ class ReduxAdvanced:
                 padded_embeddings[i, :filtered.size(0)] = filtered
             cond = padded_embeddings
 
-        for t in conditioning:
-            n = [torch.cat((t[0], cond), dim=1), t[1].copy()]
-            c.append(n)
+        for txt, keys in conditioning:
+            keys = keys.copy()
+            if "attention_mask" in keys or (strength_type == "attn_bias" and strength != 1.0):
+                attn_bias = torch.log(torch.Tensor([strength if strength_type == "attn_bias" else 1.0]))
+                mask_ref_size = keys.get("attention_mask_img_shape", (1, 1))
+                new_mask = self._create_attention_mask(
+                    txt.shape,
+                    n_cond,
+                    mask_ref_size,
+                    attn_bias,
+                    txt.device,
+                    keys.get("attention_mask", None)
+                )
+                keys["attention_mask"] = new_mask
+                keys["attention_mask_img_shape"] = mask_ref_size
+            
+            c.append([torch.cat((txt, cond), dim=1), keys])
+            
         return (c, image, masko)
 
 
@@ -252,11 +303,11 @@ class ReduxAdvanced:
 # NOTE: names should be globally unique
 NODE_CLASS_MAPPINGS = {
     "StyleModelApplySimple": StyleModelApplySimple,
-    "ReduxAdvanced": ReduxAdvanced
+    "StyleModelAdvanced": StyleModelAdvanced
 }
 
 # A dictionary that contains the friendly/humanly readable titles for the nodes
 NODE_DISPLAY_NAME_MAPPINGS = {
     "StyleModelApplySimple": "Apply style model (simple)",
-    "ReduxAdvanced": "Apply Redux model (advanced)"
+    "StyleModelAdvanced": "Style Model Advanced"
 }
